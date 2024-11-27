@@ -1719,7 +1719,7 @@ fn test_install_root_combined() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn test_install_from_pipe() {
     let (at, mut ucmd) = at_and_ucmd!();
     let target = "target";
