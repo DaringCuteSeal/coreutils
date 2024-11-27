@@ -840,22 +840,9 @@ fn copy_file(from: &Path, to: &Path) -> UResult<()> {
         }
     }
 
-    let ft = match metadata(from) {
-        Ok(ft) => ft.file_type(),
-        Err(err) => {
-            return Err(
-                InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err).into(),
-            );
-        }
-    };
-    match ft {
-        // Stream-based copying to get around the limitations of std::fs::copy
-        ft if !ft.is_file() => {
-            let mut handle = File::open(from)?;
-            copy_stream(&mut handle, to)?;
-        }
-        _ => copy_normal_file(from, to)?,
-    }
+    let mut handle = File::open(from)?;
+    // Stream-based copying to get around the limitations of std::fs::copy
+    copy_stream(&mut handle, to)?;
     Ok(())
 }
 
