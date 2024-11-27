@@ -1643,7 +1643,7 @@ fn test_install_compare_option() {
 
 #[test]
 // Matches part of tests/install/basic-1
-fn test_t_exist_dir() {
+fn test_install_t_exist_dir() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
 
@@ -1716,4 +1716,20 @@ fn test_install_root_combined() {
     run_and_check(&["-Cv", "-o2", "c", "d"], "d", 2, 0);
     run_and_check(&["-Cv", "c", "d"], "d", 0, 0);
     run_and_check(&["-Cv", "c", "d"], "d", 0, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_install_from_pipe() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let target = "target";
+    let test_string = "Hello, World!\n";
+
+    ucmd.arg("/dev/stdin")
+        .arg(target)
+        .pipe_in(test_string)
+        .succeeds();
+
+    assert!(at.file_exists(target));
+    assert_eq!(at.read(target), test_string);
 }

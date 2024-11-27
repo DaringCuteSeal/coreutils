@@ -10,13 +10,16 @@ mod mode;
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command};
 use file_diff::diff;
 use filetime::{set_file_times, FileTime};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod splice;
+
 use std::error::Error;
 use std::fmt::{Debug, Display};
-use std::fs;
 use std::fs::File;
-use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
-use std::os::unix::prelude::OsStrExt;
+use std::fs::{self, metadata};
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 use std::process;
 use uucore::backup_control::{self, BackupMode};
@@ -28,6 +31,11 @@ use uucore::mode::get_umask;
 use uucore::perms::{wrap_chown, Verbosity, VerbosityLevel};
 use uucore::process::{getegid, geteuid};
 use uucore::{format_usage, help_about, help_usage, show, show_error, show_if_err, uio_error};
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+#[cfg(unix)]
+use std::os::unix::prelude::OsStrExt;
 
 const DEFAULT_MODE: u32 = 0o755;
 const DEFAULT_STRIP_PROGRAM: &str = "strip";
@@ -127,6 +135,16 @@ impl Display for InstallError {
     }
 }
 
+#[cfg(unix)]
+pub(crate) trait FdReadable: Read + AsFd + AsRawFd {}
+#[cfg(not(unix))]
+trait FdReadable: Read {}
+
+#[cfg(unix)]
+impl<T> FdReadable for T where T: Read + AsFd + AsRawFd {}
+#[cfg(not(unix))]
+impl<T> FdReadable for T where T: Read {}
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum MainFunction {
     /// Create directories
@@ -148,23 +166,25 @@ impl Behavior {
 const ABOUT: &str = help_about!("install.md");
 const USAGE: &str = help_usage!("install.md");
 
-static OPT_COMPARE: &str = "compare";
-static OPT_DIRECTORY: &str = "directory";
-static OPT_IGNORED: &str = "ignored";
-static OPT_CREATE_LEADING: &str = "create-leading";
-static OPT_GROUP: &str = "group";
-static OPT_MODE: &str = "mode";
-static OPT_OWNER: &str = "owner";
-static OPT_PRESERVE_TIMESTAMPS: &str = "preserve-timestamps";
-static OPT_STRIP: &str = "strip";
-static OPT_STRIP_PROGRAM: &str = "strip-program";
-static OPT_TARGET_DIRECTORY: &str = "target-directory";
-static OPT_NO_TARGET_DIRECTORY: &str = "no-target-directory";
-static OPT_VERBOSE: &str = "verbose";
-static OPT_PRESERVE_CONTEXT: &str = "preserve-context";
-static OPT_CONTEXT: &str = "context";
+mod options {
+    pub static OPT_COMPARE: &str = "compare";
+    pub static OPT_DIRECTORY: &str = "directory";
+    pub static OPT_IGNORED: &str = "ignored";
+    pub static OPT_CREATE_LEADING: &str = "create-leading";
+    pub static OPT_GROUP: &str = "group";
+    pub static OPT_MODE: &str = "mode";
+    pub static OPT_OWNER: &str = "owner";
+    pub static OPT_PRESERVE_TIMESTAMPS: &str = "preserve-timestamps";
+    pub static OPT_STRIP: &str = "strip";
+    pub static OPT_STRIP_PROGRAM: &str = "strip-program";
+    pub static OPT_TARGET_DIRECTORY: &str = "target-directory";
+    pub static OPT_NO_TARGET_DIRECTORY: &str = "no-target-directory";
+    pub static OPT_VERBOSE: &str = "verbose";
+    pub static OPT_PRESERVE_CONTEXT: &str = "preserve-context";
+    pub static OPT_CONTEXT: &str = "context";
 
-static ARG_FILES: &str = "files";
+    pub static ARG_FILES: &str = "files";
+}
 
 /// Main install utility function, called from main.rs.
 ///
@@ -175,7 +195,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uu_app().try_get_matches_from(args)?;
 
     let paths: Vec<String> = matches
-        .get_many::<String>(ARG_FILES)
+        .get_many::<String>(options::ARG_FILES)
         .map(|v| v.map(ToString::to_string).collect())
         .unwrap_or_default();
 
@@ -198,15 +218,15 @@ pub fn uu_app() -> Command {
         .arg(backup_control::arguments::backup())
         .arg(backup_control::arguments::backup_no_args())
         .arg(
-            Arg::new(OPT_IGNORED)
+            Arg::new(options::OPT_IGNORED)
                 .short('c')
                 .help("ignored")
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(OPT_COMPARE)
+            Arg::new(options::OPT_COMPARE)
                 .short('C')
-                .long(OPT_COMPARE)
+                .long(options::OPT_COMPARE)
                 .help(
                     "compare each pair of source and destination files, and in some cases, \
                     do not modify the destination at all",
@@ -214,9 +234,9 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(OPT_DIRECTORY)
+            Arg::new(options::OPT_DIRECTORY)
                 .short('d')
-                .long(OPT_DIRECTORY)
+                .long(options::OPT_DIRECTORY)
                 .help(
                     "treat all arguments as directory names. create all components of \
                         the specified directories",
@@ -225,7 +245,7 @@ pub fn uu_app() -> Command {
         )
         .arg(
             // TODO implement flag
-            Arg::new(OPT_CREATE_LEADING)
+            Arg::new(options::OPT_CREATE_LEADING)
                 .short('D')
                 .help(
                     "create all leading components of DEST except the last, then copy \
@@ -234,31 +254,31 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(OPT_GROUP)
+            Arg::new(options::OPT_GROUP)
                 .short('g')
-                .long(OPT_GROUP)
+                .long(options::OPT_GROUP)
                 .help("set group ownership, instead of process's current group")
                 .value_name("GROUP"),
         )
         .arg(
-            Arg::new(OPT_MODE)
+            Arg::new(options::OPT_MODE)
                 .short('m')
-                .long(OPT_MODE)
+                .long(options::OPT_MODE)
                 .help("set permission mode (as in chmod), instead of rwxr-xr-x")
                 .value_name("MODE"),
         )
         .arg(
-            Arg::new(OPT_OWNER)
+            Arg::new(options::OPT_OWNER)
                 .short('o')
-                .long(OPT_OWNER)
+                .long(options::OPT_OWNER)
                 .help("set ownership (super-user only)")
                 .value_name("OWNER")
                 .value_hint(clap::ValueHint::Username),
         )
         .arg(
-            Arg::new(OPT_PRESERVE_TIMESTAMPS)
+            Arg::new(options::OPT_PRESERVE_TIMESTAMPS)
                 .short('p')
-                .long(OPT_PRESERVE_TIMESTAMPS)
+                .long(options::OPT_PRESERVE_TIMESTAMPS)
                 .help(
                     "apply access/modification times of SOURCE files to \
                     corresponding destination files",
@@ -266,15 +286,15 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(OPT_STRIP)
+            Arg::new(options::OPT_STRIP)
                 .short('s')
-                .long(OPT_STRIP)
+                .long(options::OPT_STRIP)
                 .help("strip symbol tables (no action Windows)")
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(OPT_STRIP_PROGRAM)
-                .long(OPT_STRIP_PROGRAM)
+            Arg::new(options::OPT_STRIP_PROGRAM)
+                .long(options::OPT_STRIP_PROGRAM)
                 .help("program used to strip binaries (no action Windows)")
                 .value_name("PROGRAM")
                 .value_hint(clap::ValueHint::CommandName),
@@ -282,47 +302,47 @@ pub fn uu_app() -> Command {
         .arg(backup_control::arguments::suffix())
         .arg(
             // TODO implement flag
-            Arg::new(OPT_TARGET_DIRECTORY)
+            Arg::new(options::OPT_TARGET_DIRECTORY)
                 .short('t')
-                .long(OPT_TARGET_DIRECTORY)
+                .long(options::OPT_TARGET_DIRECTORY)
                 .help("move all SOURCE arguments into DIRECTORY")
                 .value_name("DIRECTORY")
                 .value_hint(clap::ValueHint::DirPath),
         )
         .arg(
             // TODO implement flag
-            Arg::new(OPT_NO_TARGET_DIRECTORY)
+            Arg::new(options::OPT_NO_TARGET_DIRECTORY)
                 .short('T')
-                .long(OPT_NO_TARGET_DIRECTORY)
+                .long(options::OPT_NO_TARGET_DIRECTORY)
                 .help("(unimplemented) treat DEST as a normal file")
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(OPT_VERBOSE)
+            Arg::new(options::OPT_VERBOSE)
                 .short('v')
-                .long(OPT_VERBOSE)
+                .long(options::OPT_VERBOSE)
                 .help("explain what is being done")
                 .action(ArgAction::SetTrue),
         )
         .arg(
             // TODO implement flag
-            Arg::new(OPT_PRESERVE_CONTEXT)
+            Arg::new(options::OPT_PRESERVE_CONTEXT)
                 .short('P')
-                .long(OPT_PRESERVE_CONTEXT)
+                .long(options::OPT_PRESERVE_CONTEXT)
                 .help("(unimplemented) preserve security context")
                 .action(ArgAction::SetTrue),
         )
         .arg(
             // TODO implement flag
-            Arg::new(OPT_CONTEXT)
+            Arg::new(options::OPT_CONTEXT)
                 .short('Z')
-                .long(OPT_CONTEXT)
+                .long(options::OPT_CONTEXT)
                 .help("(unimplemented) set security context of files and directories")
                 .value_name("CONTEXT")
                 .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::new(ARG_FILES)
+            Arg::new(options::ARG_FILES)
                 .action(ArgAction::Append)
                 .num_args(1..)
                 .value_hint(clap::ValueHint::AnyPath),
@@ -339,11 +359,11 @@ pub fn uu_app() -> Command {
 ///
 ///
 fn check_unimplemented(matches: &ArgMatches) -> UResult<()> {
-    if matches.get_flag(OPT_NO_TARGET_DIRECTORY) {
+    if matches.get_flag(options::OPT_NO_TARGET_DIRECTORY) {
         Err(InstallError::Unimplemented(String::from("--no-target-directory, -T")).into())
-    } else if matches.get_flag(OPT_PRESERVE_CONTEXT) {
+    } else if matches.get_flag(options::OPT_PRESERVE_CONTEXT) {
         Err(InstallError::Unimplemented(String::from("--preserve-context, -P")).into())
-    } else if matches.get_flag(OPT_CONTEXT) {
+    } else if matches.get_flag(options::OPT_CONTEXT) {
         Err(InstallError::Unimplemented(String::from("--context, -Z")).into())
     } else {
         Ok(())
@@ -359,7 +379,7 @@ fn check_unimplemented(matches: &ArgMatches) -> UResult<()> {
 /// In event of failure, returns an integer intended as a program return code.
 ///
 fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
-    let main_function = if matches.get_flag(OPT_DIRECTORY) {
+    let main_function = if matches.get_flag(options::OPT_DIRECTORY) {
         MainFunction::Directory
     } else {
         MainFunction::Standard
@@ -367,8 +387,8 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
 
     let considering_dir: bool = MainFunction::Directory == main_function;
 
-    let specified_mode: Option<u32> = if matches.contains_id(OPT_MODE) {
-        let x = matches.get_one::<String>(OPT_MODE).ok_or(1)?;
+    let specified_mode: Option<u32> = if matches.contains_id(options::OPT_MODE) {
+        let x = matches.get_one::<String>(options::OPT_MODE).ok_or(1)?;
         Some(mode::parse(x, considering_dir, get_umask()).map_err(|err| {
             show_error!("Invalid mode string: {}", err);
             1
@@ -378,11 +398,13 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
     };
 
     let backup_mode = backup_control::determine_backup_mode(matches)?;
-    let target_dir = matches.get_one::<String>(OPT_TARGET_DIRECTORY).cloned();
+    let target_dir = matches
+        .get_one::<String>(options::OPT_TARGET_DIRECTORY)
+        .cloned();
 
-    let preserve_timestamps = matches.get_flag(OPT_PRESERVE_TIMESTAMPS);
-    let compare = matches.get_flag(OPT_COMPARE);
-    let strip = matches.get_flag(OPT_STRIP);
+    let preserve_timestamps = matches.get_flag(options::OPT_PRESERVE_TIMESTAMPS);
+    let compare = matches.get_flag(options::OPT_COMPARE);
+    let strip = matches.get_flag(options::OPT_STRIP);
     if preserve_timestamps && compare {
         show_error!("Options --compare and --preserve-timestamps are mutually exclusive");
         return Err(1.into());
@@ -393,7 +415,7 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
     }
 
     let owner = matches
-        .get_one::<String>(OPT_OWNER)
+        .get_one::<String>(options::OPT_OWNER)
         .map(|s| s.as_str())
         .unwrap_or("")
         .to_string();
@@ -408,7 +430,7 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
     };
 
     let group = matches
-        .get_one::<String>(OPT_GROUP)
+        .get_one::<String>(options::OPT_GROUP)
         .map(|s| s.as_str())
         .unwrap_or("")
         .to_string();
@@ -429,17 +451,17 @@ fn behavior(matches: &ArgMatches) -> UResult<Behavior> {
         suffix: backup_control::determine_backup_suffix(matches),
         owner_id,
         group_id,
-        verbose: matches.get_flag(OPT_VERBOSE),
+        verbose: matches.get_flag(options::OPT_VERBOSE),
         preserve_timestamps,
         compare,
         strip,
         strip_program: String::from(
             matches
-                .get_one::<String>(OPT_STRIP_PROGRAM)
+                .get_one::<String>(options::OPT_STRIP_PROGRAM)
                 .map(|s| s.as_str())
                 .unwrap_or(DEFAULT_STRIP_PROGRAM),
         ),
-        create_leading: matches.get_flag(OPT_CREATE_LEADING),
+        create_leading: matches.get_flag(options::OPT_CREATE_LEADING),
         target_dir,
     })
 }
@@ -736,7 +758,65 @@ fn perform_backup(to: &Path, b: &Behavior) -> UResult<Option<PathBuf>> {
     }
 }
 
-/// Copy a file from one path to another.
+/// Copy a non-special file using std::fs::copy.
+///
+/// # Parameters
+/// * `from` - The source file path.
+/// * `to` - The destination file path.
+///
+/// # Returns
+///
+/// Returns an empty Result or an error in case of failure.
+fn copy_normal_file(from: &Path, to: &Path) -> UResult<()> {
+    if let Err(err) = fs::copy(from, to) {
+        return Err(InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err).into());
+    }
+    Ok(())
+}
+
+/// Read from stream into specified target file.
+///
+/// # Parameters
+/// * `handle` - Open file handle.
+/// * `to` - The destination file path.
+///
+/// # Returns
+///
+/// Returns an empty Result or an error in case of failure.
+fn copy_stream<R: FdReadable>(handle: &mut R, to: &Path) -> UResult<()> {
+    // Overwrite the target file.
+    let mut target_file = File::create(to)?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // If we're on Linux or Android, try to use the splice() system call
+        // for faster writing. If it works, we're done.
+        if !splice::write_fast_using_splice(handle, &target_file.as_fd())? {
+            return Ok(());
+        }
+    }
+    // If we're not on Linux or Android, or the splice() call failed,
+    // fall back on slower writing.
+    let mut buf = [0; 1024 * 64];
+    while let Ok(n) = handle.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        target_file.write_all(&buf[..n])?;
+    }
+
+    // If the splice() call failed and there has been some data written to
+    // stdout via while loop above AND there will be second splice() call
+    // that will succeed, data pushed through splice will be output before
+    // the data buffered in stdout.lock. Therefore additional explicit flush
+    // is required here.
+    target_file.flush()?;
+    Ok(())
+}
+
+/// Copy a
+/// Copy a file from one path to another. Handles the certain cases of special files (e.g character
+/// specials)
 ///
 /// # Parameters
 ///
@@ -760,17 +840,21 @@ fn copy_file(from: &Path, to: &Path) -> UResult<()> {
         }
     }
 
-    if from.as_os_str() == "/dev/null" {
-        /* workaround a limitation of fs::copy
-         * https://github.com/rust-lang/rust/issues/79390
-         */
-        if let Err(err) = File::create(to) {
+    let ft = match metadata(from) {
+        Ok(ft) => ft.file_type(),
+        Err(err) => {
             return Err(
                 InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err).into(),
             );
         }
-    } else if let Err(err) = fs::copy(from, to) {
-        return Err(InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err).into());
+    };
+    match ft {
+        // Stream-based copying to get around the limitations of std::fs::copy
+        ft if ft.is_char_device() || ft.is_block_device() || ft.is_fifo() => {
+            let mut handle = File::open(from)?;
+            copy_stream(&mut handle, to)?;
+        }
+        _ => copy_normal_file(from, to)?,
     }
     Ok(())
 }
