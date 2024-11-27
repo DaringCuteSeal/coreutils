@@ -850,7 +850,7 @@ fn copy_file(from: &Path, to: &Path) -> UResult<()> {
     };
     match ft {
         // Stream-based copying to get around the limitations of std::fs::copy
-        ft if ft.is_char_device() || ft.is_block_device() || ft.is_fifo() => {
+        ft if !ft.is_file() => {
             let mut handle = File::open(from)?;
             copy_stream(&mut handle, to)?;
         }
