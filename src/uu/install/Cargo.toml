@@ -29,7 +29,7 @@ uucore = { workspace = true, features = [
   "perms",
   "entries",
   "process",
-  "pipes"
+  "pipes",
 ] }
 
 [[bin]]
