@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(not(windows))]
 use std::ffi::CString;
 use std::ffi::OsString;
-use std::fs::{self, File, Metadata, OpenOptions, Permissions};
+use std::fs::{self, Metadata, OpenOptions, Permissions};
 use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -1934,9 +1934,11 @@ fn handle_copy_mode(
     let source_is_symlink = source_file_type.is_symlink();
 
     #[cfg(unix)]
+    let source_is_stream = source_file_type.is_fifo()
+        || source_file_type.is_block_device()
+        || source_file_type.is_char_device();
+    #[cfg(unix)]
     let source_is_fifo = source_file_type.is_fifo();
-    #[cfg(not(unix))]
-    let source_is_fifo = false;
 
     match options.copy_mode {
         CopyMode::Link => {
@@ -1971,7 +1973,10 @@ fn handle_copy_mode(
                 options,
                 context,
                 source_is_symlink,
+                #[cfg(unix)]
                 source_is_fifo,
+                #[cfg(unix)]
+                source_is_stream,
                 symlinked_files,
             )?;
         }
@@ -1991,7 +1996,10 @@ fn handle_copy_mode(
                             options,
                             context,
                             source_is_symlink,
+                            #[cfg(unix)]
                             source_is_fifo,
+                            #[cfg(unix)]
+                            source_is_stream,
                             symlinked_files,
                         )?;
                     }
@@ -2021,7 +2029,10 @@ fn handle_copy_mode(
                                 options,
                                 context,
                                 source_is_symlink,
+                                #[cfg(unix)]
                                 source_is_fifo,
+                                #[cfg(unix)]
+                                source_is_stream,
                                 symlinked_files,
                             )?;
                         }
@@ -2034,7 +2045,10 @@ fn handle_copy_mode(
                     options,
                     context,
                     source_is_symlink,
+                    #[cfg(unix)]
                     source_is_fifo,
+                    #[cfg(unix)]
+                    source_is_stream,
                     symlinked_files,
                 )?;
             }
@@ -2284,6 +2298,19 @@ fn copy_file(
     }
 
     if options.dereference(source_in_command_line) {
+        // HACK: when `cp` reads from inter-process pipe, its original pipe would've been
+        // inaccessible once we reach this part of the code as it has been closed. That means we
+        // can't dereference it to get its attribute.
+        // find a more reliable way to distinguish between named pipes and anonymous pipes.
+        #[cfg(unix)]
+        if source_metadata.file_type().is_fifo() {
+            copy_attributes(source, dest, &options.attributes)?;
+        } else if let Ok(src) = canonicalize(source, MissingHandling::Normal, ResolveMode::Physical)
+        {
+            copy_attributes(&src, dest, &options.attributes)?;
+        }
+
+        #[cfg(not(unix))]
         if let Ok(src) = canonicalize(source, MissingHandling::Normal, ResolveMode::Physical) {
             copy_attributes(&src, dest, &options.attributes)?;
         }
@@ -2350,13 +2377,15 @@ fn handle_no_preserve_mode(options: &Options, org_mode: u32) -> u32 {
 
 /// Copy the file from `source` to `dest` either using the normal `fs::copy` or a
 /// copy-on-write scheme if --reflink is specified and the filesystem supports it.
+#[allow(clippy::too_many_arguments)]
 fn copy_helper(
     source: &Path,
     dest: &Path,
     options: &Options,
     context: &str,
     source_is_symlink: bool,
-    source_is_fifo: bool,
+    #[cfg(unix)] source_is_fifo: bool,
+    #[cfg(unix)] source_is_stream: bool,
     symlinked_files: &mut HashSet<FileInformation>,
 ) -> CopyResult<()> {
     if options.parents {
@@ -2368,15 +2397,13 @@ fn copy_helper(
         return Err(Error::NotADirectory(dest.to_path_buf()));
     }
 
-    if source.as_os_str() == "/dev/null" {
-        /* workaround a limitation of fs::copy
-         * https://github.com/rust-lang/rust/issues/79390
-         */
-        File::create(dest).context(dest.display().to_string())?;
-    } else if source_is_fifo && options.recursive && !options.copy_contents {
+    #[cfg(unix)]
+    if source_is_fifo && options.recursive && !options.copy_contents {
         #[cfg(unix)]
         copy_fifo(dest, options.overwrite, options.debug)?;
-    } else if source_is_symlink {
+        return Ok(());
+    }
+    if source_is_symlink {
         copy_link(source, dest, symlinked_files)?;
     } else {
         let copy_debug = copy_on_write(
@@ -2385,7 +2412,9 @@ fn copy_helper(
             options.reflink_mode,
             options.sparse_mode,
             context,
-            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+            #[cfg(unix)]
+            source_is_stream,
+            #[cfg(unix)]
             source_is_fifo,
         )?;
 
