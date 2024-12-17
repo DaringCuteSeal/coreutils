@@ -14,7 +14,7 @@ use std::os::fd::AsFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::fcntl::SpliceFFlags;
 
-pub use nix::{Error, Result};
+pub use nix::Result;
 
 /// A wrapper around [`nix::unistd::pipe`] that ensures the pipe is cleaned up.
 ///
