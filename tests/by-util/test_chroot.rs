@@ -243,3 +243,18 @@ fn test_chroot_extra_arg() {
         print!("Test skipped; requires root user");
     }
 }
+
+#[test]
+fn test_chroot_multiple_groups_arg() {
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
+
+    let dir = "CHROOT_DIR";
+    at.mkdir(dir);
+    if let Ok(result) = run_ucmd_as_root(&ts, &[dir, "--groups='ignored'", "--groups=''", "whoami"])
+    {
+        result.success().no_stderr().stdout_is("root");
+    } else {
+        print!("Test skipped; requires root user");
+    }
+}
