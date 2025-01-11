@@ -255,6 +255,7 @@ pub fn uu_app() -> Command {
             Arg::new(options::GROUPS)
                 .long(options::GROUPS)
                 .help("Comma-separated list of groups to switch to")
+                .overrides_with(options::GROUPS)
                 .value_name("GROUP1,GROUP2..."),
         )
         .arg(
